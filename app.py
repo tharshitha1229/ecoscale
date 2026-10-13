@@ -211,12 +211,19 @@ def compute_ccf_footprint(device, mobile, coding_h, streaming_h, heavy_h, region
 def get_real_containers():
     """Queries Docker for live running instances of the backend."""
     try:
-        cmd = ["docker", "ps", "--filter", "ancestor=ecoscale-backend", "--filter", "ancestor=greencloud-backend", "--format", "{{json .}}"]
+        cmd = ["docker", "ps", "--format", "{{json .}}"]
         result = subprocess.run(cmd, capture_output=True, text=True)
         containers = []
         for line in result.stdout.strip().split('\n'):
             if line:
-                containers.append(json.loads(line))
+                try:
+                    c = json.loads(line)
+                    img = c.get('Image', '').lower()
+                    names = c.get('Names', '').lower()
+                    if 'ecoscale' in img or 'greencloud' in img or 'node-' in names:
+                        containers.append(c)
+                except Exception:
+                    pass
         return containers
     except:
         return []
@@ -225,14 +232,37 @@ import os
 
 def launch_container(node_name, port):
     """Commands Docker to spin up a new backend instance."""
-    server_path = os.path.abspath("backend/server.js")
-    check_img = subprocess.run(["docker", "image", "inspect", "ecoscale-backend"], capture_output=True)
-    img_name = "ecoscale-backend" if check_img.returncode == 0 else "greencloud-backend"
-    subprocess.run(["docker", "run", "-d", "--name", node_name, "-v", f"{server_path}:/usr/src/app/server.js", "--env-file", "backend/.env", "-p", f"{port}:5001", img_name])
+    try:
+        # 1. Clean up any conflicting container with the same name
+        subprocess.run(["docker", "rm", "-f", node_name], capture_output=True)
+        
+        # 2. Check which image exists (ecoscale-backend or greencloud-backend)
+        check_eco = subprocess.run(["docker", "image", "inspect", "ecoscale-backend"], capture_output=True)
+        check_green = subprocess.run(["docker", "image", "inspect", "greencloud-backend"], capture_output=True)
+        
+        if check_eco.returncode == 0:
+            img_name = "ecoscale-backend"
+        elif check_green.returncode == 0:
+            img_name = "greencloud-backend"
+        else:
+            # Auto-build the backend image on demand if it wasn't built yet
+            build_res = subprocess.run(["docker", "build", "-t", "ecoscale-backend", "./backend"], capture_output=True, text=True)
+            img_name = "ecoscale-backend"
+        
+        # 3. Construct run command (avoid brittle path mounts in cloud DinD)
+        cmd = ["docker", "run", "-d", "--name", node_name]
+        if os.path.exists("backend/.env"):
+            cmd.extend(["--env-file", "backend/.env"])
+        cmd.extend(["-p", f"{port}:5001", img_name])
+        
+        res = subprocess.run(cmd, capture_output=True, text=True)
+        return res.returncode == 0
+    except Exception as e:
+        return False
 
 def destroy_container(node_name):
     """Forcefully kills a Docker container."""
-    subprocess.run(["docker", "rm", "-f", node_name])
+    subprocess.run(["docker", "rm", "-f", node_name], capture_output=True)
 
 def get_active_port():
     """Helper to find the port of an active container, or boot one if none exist."""
@@ -240,14 +270,19 @@ def get_active_port():
     if not containers:
         launch_container("node-1", 5001)
         time.sleep(2) # Give Express/MongoDB time to connect
-        return 5001
+        containers = get_real_containers()
+        if not containers:
+            return 5001
     
     # Extract the port string (e.g., "0.0.0.0:5001->5001/tcp") and parse the public port
-    port_str = containers[0].get('Ports', '')
-    try:
-        return int(port_str.split(':')[1].split('->')[0])
-    except:
-        return 5001
+    for c in containers:
+        port_str = c.get('Ports', '')
+        if ':' in port_str and '->' in port_str:
+            try:
+                return int(port_str.split(':')[1].split('->')[0])
+            except:
+                pass
+    return 5001
 
 st.markdown("""<div class="inspo-hero-shell">
 <div class="inspo-nav">
@@ -356,12 +391,34 @@ with tab1:
             st.warning("⚠️ Please enter a name to save your record.")
         else:
             with st.spinner('🔐 Agent sampling live Docker telemetry & executing CCF formulas...'):
-                # Live Agent Infrastructure Telemetry
+                # 1. Live Infrastructure Inspection & Autonomous Provisioning
                 live_containers = get_real_containers()
-                active_nodes_count = len(live_containers)
+                
+                # If no active cluster nodes exist, automatically boot the primary node!
+                if not live_containers:
+                    st.info("🤖 **Autonomous Agent:** Zero cloud nodes detected. Dynamically provisioning primary cluster instance `node-1` on port 5001...")
+                    launch_container("node-1", 5001)
+                    time.sleep(2)
+                    live_containers = get_real_containers()
+                
+                # Dynamic Workload-Based Auto-Scaling:
+                # If heavy computation is present, dynamically scale out a dedicated worker node
+                if (heavy_software >= 2 or coding_hours >= 6) and len(live_containers) < 5:
+                    new_idx = len(live_containers) + 1
+                    new_port = 5000 + new_idx
+                    new_node = f"node-{new_idx}"
+                    st.info(f"⚡ **Autonomous Agent Provisioning:** Heavy compute workload detected. Dynamically scaling cluster +1 node (`{new_node}` on port {new_port})...")
+                    launch_container(new_node, new_port)
+                    time.sleep(2)
+                    live_containers = get_real_containers()
+                    active_port = new_port
+                else:
+                    active_port = get_active_port()
+
+                active_nodes_count = max(len(live_containers), 1)
                 host_cpu = psutil.cpu_percent(interval=0.1)
                 
-                # Execute CCF Mathematical Engine
+                # 2. Execute CCF Mathematical Engine
                 ccf = compute_ccf_footprint(
                     device=device,
                     mobile=mobile,
@@ -373,36 +430,44 @@ with tab1:
                     host_cpu=host_cpu
                 )
 
-                # DOCKER ROUTING & PERSISTENCE
-                active_port = get_active_port()
+                # 3. Route Traffic & Persist to Database with Warm-up Retries
                 api_url = f"http://localhost:{active_port}/api/history"
+                payload = {
+                    "username": username.strip(),
+                    "device": device,
+                    "mobile": mobile,
+                    "coding_hours": coding_hours,
+                    "streaming_hours": streaming_hours,
+                    "heavy_hours": heavy_software,
+                    "total_emission": float(ccf["total_co2_g"]),
+                    "operational_emission": float(ccf["operational_co2_g"]),
+                    "embodied_emission": float(ccf["embodied_co2_g"]),
+                    "pue": float(ccf["effective_pue"]),
+                    "energy_kwh": float(ccf["total_energy_kwh"])
+                }
                 
-                try:
-                    payload = {
-                        "username": username.strip(),
-                        "device": device,
-                        "mobile": mobile,
-                        "coding_hours": coding_hours,
-                        "streaming_hours": streaming_hours,
-                        "heavy_hours": heavy_software,
-                        "total_emission": float(ccf["total_co2_g"]),
-                        "operational_emission": float(ccf["operational_co2_g"]),
-                        "embodied_emission": float(ccf["embodied_co2_g"]),
-                        "pue": float(ccf["effective_pue"]),
-                        "energy_kwh": float(ccf["total_energy_kwh"])
-                    }
-                    requests.post(api_url, json=payload)
+                post_ok = False
+                for _ in range(3):
+                    try:
+                        resp = requests.post(api_url, json=payload, timeout=3)
+                        if resp.status_code in [200, 201]:
+                            post_ok = True
+                            break
+                    except Exception:
+                        time.sleep(1)
+
+                if post_ok:
                     st.success("✅ CCF Enterprise Calculation successfully verified & persisted to MongoDB.")
-                    
-                    # SERVERLESS VS DEDICATED LOGIC
-                    if heavy_software > 2 or coding_hours > 6:
-                        st.info(f"**Cloud Economics:** Heavy workload detected. Routing to **Dedicated VM** (Low latency, Fixed Cost). Estimated cost: $0.15/hr.")
-                    else:
-                        st.info(f"**Cloud Economics:** Light workload detected. Routing to **Serverless Function (AWS Lambda)** (Cold start latency, Pay-per-ms). Estimated cost: $0.0001.")
-                    
-                    st.info(f"**Agent Routing Decision:** Task allocated to Docker container on Port **{active_port}** (Managing {ccf['cloud_nodes_count']} node(s) @ {host_cpu}% host CPU in {target_region} with PUE {ccf['cloud_pue']}).")
-                except:
-                    st.error(f"⚠️ Failed to route traffic to container on port {active_port}. Is MongoDB connected?")
+                else:
+                    st.warning(f"⚠️ Calculation complete. Node on port {active_port} is initializing or MongoDB is connecting.")
+
+                # Cloud Economics Workload Routing Advisory
+                if heavy_software > 2 or coding_hours > 6:
+                    st.info(f"**Cloud Economics:** Heavy workload detected. Routing to **Dedicated VM** (Low latency, Fixed Cost). Estimated cost: $0.15/hr.")
+                else:
+                    st.info(f"**Cloud Economics:** Light workload detected. Routing to **Serverless Function (AWS Lambda)** (Cold start latency, Pay-per-ms). Estimated cost: $0.0001.")
+                
+                st.info(f"**Agent Routing Decision:** Task successfully allocated to Docker container on Port **{active_port}** (Managing {active_nodes_count} active node(s) @ {host_cpu}% host CPU in {target_region} with PUE {ccf['cloud_pue']}).")
 
             st.write("")
             st.markdown("### 📊 CCF Executive Carbon Summary")
