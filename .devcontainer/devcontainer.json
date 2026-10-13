@@ -1,0 +1,23 @@
+{
+  "name": "EcoScale Cloud Orchestrator",
+  "image": "mcr.microsoft.com/devcontainers/universal:2-linux",
+  "features": {
+    "ghcr.io/devcontainers/features/docker-in-docker:2": {
+      "version": "latest",
+      "enableNonRootDocker": "true"
+    }
+  },
+  "forwardPorts": [8501, 5001, 5002, 5003],
+  "portsAttributes": {
+    "8501": {
+      "label": "EcoScale Streamlit App",
+      "onAutoForward": "openBrowser",
+      "visibility": "public"
+    },
+    "5001": {
+      "label": "EcoScale Backend Node 1",
+      "onAutoForward": "silent"
+    }
+  },
+  "postCreateCommand": "pip install -r requirements.txt && docker build -t ecoscale-backend ./backend && docker tag ecoscale-backend greencloud-backend 2>/dev/null || true"
+}
